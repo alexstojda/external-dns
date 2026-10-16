@@ -20,11 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
-	ambassador "github.com/datawire/ambassador/pkg/api/getambassador.io/v2"
+	ambassador "github.com/emissary-ingress/emissary/v3/pkg/api/getambassador.io/v3alpha1"
 	log "github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -35,9 +35,11 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/cache"
+
+	"sigs.k8s.io/external-dns/source/types"
 
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/pkg/events"
 	"sigs.k8s.io/external-dns/source/annotations"
 	"sigs.k8s.io/external-dns/source/informers"
 )
@@ -50,7 +52,7 @@ const (
 )
 
 var (
-	schemeGroupVersion = schema.GroupVersion{Group: groupName, Version: "v2"}
+	schemeGroupVersion = schema.GroupVersion{Group: groupName, Version: "v3alpha1"}
 	ambHostGVR         = schemeGroupVersion.WithResource("hosts")
 )
 
@@ -65,11 +67,13 @@ var (
 // +externaldns:source:filters=annotation,label
 // +externaldns:source:namespace=all,single
 // +externaldns:source:fqdn-template=false
+// +externaldns:source:events=false
+// +externaldns:source:provider-specific=true
 type ambassadorHostSource struct {
 	dynamicKubeClient      dynamic.Interface
 	kubeClient             kubernetes.Interface
 	namespace              string
-	annotationFilter       string
+	annotationFilter       labels.Selector
 	ambassadorHostInformer kubeinformers.GenericInformer
 	unstructuredConverter  *unstructuredConverter
 	labelSelector          labels.Selector
@@ -80,22 +84,21 @@ func NewAmbassadorHostSource(
 	ctx context.Context,
 	dynamicKubeClient dynamic.Interface,
 	kubeClient kubernetes.Interface,
-	namespace string,
-	annotationFilter string,
-	labelSelector labels.Selector,
+	cfg *Config,
 ) (Source, error) {
 	// Use shared informer to listen for add/update/delete of Host in the specified namespace.
 	// Set resync period to 0, to prevent processing when nothing has changed.
+	namespace := cfg.Namespace()
 	informerFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dynamicKubeClient, 0, namespace, nil)
 	ambassadorHostInformer := informerFactory.ForResource(ambHostGVR)
 
+	informers.MustSetTransform(ambassadorHostInformer.Informer(), informers.TransformerWithOptions[*unstructured.Unstructured](
+		informers.TransformRemoveManagedFields(),
+		informers.TransformRemoveLastAppliedConfig(),
+	))
+
 	// Add default resource event handlers to properly initialize informer.
-	_, _ = ambassadorHostInformer.Informer().AddEventHandler(
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj any) {
-			},
-		},
-	)
+	informers.MustAddEventHandler(ambassadorHostInformer.Informer(), informers.DefaultEventHandler())
 
 	informerFactory.Start(ctx.Done())
 
@@ -104,7 +107,7 @@ func NewAmbassadorHostSource(
 		return nil, err
 	}
 
-	uc, err := newUnstructuredConverter()
+	uc, err := newAmbassadorUnstructuredConverter()
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup Unstructured Converter: %w", err)
 	}
@@ -113,10 +116,10 @@ func NewAmbassadorHostSource(
 		dynamicKubeClient:      dynamicKubeClient,
 		kubeClient:             kubeClient,
 		namespace:              namespace,
-		annotationFilter:       annotationFilter,
+		annotationFilter:       cfg.AnnotationFilter,
 		ambassadorHostInformer: ambassadorHostInformer,
 		unstructuredConverter:  uc,
-		labelSelector:          labelSelector,
+		labelSelector:          cfg.LabelFilter,
 	}, nil
 }
 
@@ -145,10 +148,7 @@ func (sc *ambassadorHostSource) Endpoints(ctx context.Context) ([]*endpoint.Endp
 	}
 
 	// Filter Ambassador Hosts
-	ambassadorHosts, err = annotations.Filter(ambassadorHosts, sc.annotationFilter)
-	if err != nil {
-		return nil, fmt.Errorf("failed to filter Ambassador Hosts by annotation: %w", err)
-	}
+	ambassadorHosts = annotations.Filter(ambassadorHosts, sc.annotationFilter)
 
 	var endpoints []*endpoint.Endpoint
 
@@ -171,29 +171,22 @@ func (sc *ambassadorHostSource) Endpoints(ctx context.Context) ([]*endpoint.Endp
 			}
 		}
 
-		hostEndpoints, err := sc.endpointsFromHost(host, targets)
-		if err != nil {
-			log.Warningf("Could not get endpoints for Host %s", err)
+		hostEndpoints := sc.endpointsFromHost(host, targets)
+		if endpoint.HasNoEmptyEndpoints(hostEndpoints, types.AmbassadorHost, host) {
 			continue
 		}
-		if len(hostEndpoints) == 0 {
-			log.Debugf("No endpoints could be generated from Host %s", fullname)
-			continue
-		}
+
+		endpoint.AttachRefObject(hostEndpoints, events.NewObjectReference(host, types.AmbassadorHost))
 
 		log.Debugf("Endpoints generated from Host: %s: %v", fullname, hostEndpoints)
 		endpoints = append(endpoints, hostEndpoints...)
 	}
 
-	for _, ep := range endpoints {
-		sort.Sort(ep.Targets)
-	}
-
-	return endpoints, nil
+	return endpoint.MergeEndpoints(endpoints), nil
 }
 
 // endpointsFromHost extracts the endpoints from a Host object
-func (sc *ambassadorHostSource) endpointsFromHost(host *ambassador.Host, targets endpoint.Targets) ([]*endpoint.Endpoint, error) {
+func (sc *ambassadorHostSource) endpointsFromHost(host *ambassador.Host, targets endpoint.Targets) []*endpoint.Endpoint {
 	var endpoints []*endpoint.Endpoint
 
 	resource := fmt.Sprintf("host/%s/%s", host.Namespace, host.Name)
@@ -203,11 +196,11 @@ func (sc *ambassadorHostSource) endpointsFromHost(host *ambassador.Host, targets
 	if host.Spec != nil {
 		hostname := host.Spec.Hostname
 		if hostname != "" {
-			endpoints = append(endpoints, EndpointsForHostname(hostname, targets, ttl, providerSpecific, setIdentifier, resource)...)
+			endpoints = append(endpoints, endpoint.EndpointsForHostname(hostname, targets, ttl, providerSpecific, setIdentifier, resource)...)
 		}
 	}
 
-	return endpoints, nil
+	return endpoints
 }
 
 func (sc *ambassadorHostSource) targetsFromAmbassadorLoadBalancer(ctx context.Context, service string) (endpoint.Targets, error) {
@@ -256,7 +249,7 @@ func parseAmbLoadBalancerService(service string) (string, string, error) {
 		// If here, we have no separator, so the whole string is the service, and
 		// we can assume the default namespace.
 		name := service
-		namespace := "default"
+		namespace := corev1.NamespaceDefault
 
 		return namespace, name, nil
 	} else if len(parts) == 2 {
@@ -272,7 +265,7 @@ func parseAmbLoadBalancerService(service string) (string, string, error) {
 	return "", "", fmt.Errorf("invalid external-dns service: %s", service)
 }
 
-func (sc *ambassadorHostSource) AddEventHandler(ctx context.Context, handler func()) {
+func (sc *ambassadorHostSource) AddEventHandler(_ context.Context, _ func()) {
 }
 
 // unstructuredConverter handles conversions between unstructured.Unstructured and Ambassador types
@@ -281,8 +274,8 @@ type unstructuredConverter struct {
 	scheme *runtime.Scheme
 }
 
-// newUnstructuredConverter returns a new unstructuredConverter initialized
-func newUnstructuredConverter() (*unstructuredConverter, error) {
+// newAmbassadorUnstructuredConverter returns a new unstructuredConverter initialized
+func newAmbassadorUnstructuredConverter() (*unstructuredConverter, error) {
 	uc := &unstructuredConverter{
 		scheme: runtime.NewScheme(),
 	}

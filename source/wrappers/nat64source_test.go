@@ -17,12 +17,12 @@ limitations under the License.
 package wrappers
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/internal/testutils"
 	"sigs.k8s.io/external-dns/source"
@@ -80,11 +80,11 @@ func testNat64Source(t *testing.T) {
 			source, err := NewNAT64Source(mockSource, []string{"2001:DB8::/96"})
 			require.NoError(t, err)
 
-			endpoints, err := source.Endpoints(context.Background())
+			endpoints, err := source.Endpoints(t.Context())
 			require.NoError(t, err)
 
 			// Validate returned endpoints against desired endpoints.
-			validateEndpoints(t, endpoints, tc.expected)
+			testutils.ValidateEndpoints(t, endpoints, tc.expected)
 
 			// Validate that the mock source was called.
 			mockSource.AssertExpectations(t)
@@ -180,9 +180,9 @@ func TestNewNAT64Source(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			src, err := NewNAT64Source(tt.args.source, tt.args.nat64Prefixes)
 			if tt.wantErr {
-				assert.Error(t, err)
+				require.Error(t, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
 			assert.Equal(t, tt.want, src)
 		})
@@ -201,7 +201,7 @@ func TestNat64SourceEndpoints_VariousCases(t *testing.T) {
 			name:      "expect source error propagation",
 			mockError: assert.AnError,
 			asserts: func(eps []*endpoint.Endpoint, err error) {
-				assert.Nil(t, eps)
+				require.Nil(t, eps)
 				require.Error(t, err)
 				require.ErrorIs(t, err, assert.AnError)
 			},
@@ -212,7 +212,7 @@ func TestNat64SourceEndpoints_VariousCases(t *testing.T) {
 				{DNSName: "foo.example.org", RecordType: endpoint.RecordTypeA, Targets: endpoint.Targets{"10.10.10.11"}},
 			},
 			asserts: func(eps []*endpoint.Endpoint, err error) {
-				assert.NotNil(t, eps)
+				require.NotNil(t, eps)
 				assert.Len(t, eps, 1)
 				require.NoError(t, err)
 			},
@@ -223,9 +223,9 @@ func TestNat64SourceEndpoints_VariousCases(t *testing.T) {
 				{DNSName: "foo.example.org", RecordType: endpoint.RecordTypeAAAA, Targets: endpoint.Targets{"not-an-ip"}},
 			},
 			asserts: func(eps []*endpoint.Endpoint, err error) {
-				assert.Nil(t, eps)
+				require.Nil(t, eps)
 				require.Error(t, err)
-				assert.EqualError(t, err, "ParseAddr(\"not-an-ip\"): unable to parse IP")
+				require.EqualError(t, err, "ParseAddr(\"not-an-ip\"): unable to parse IP")
 			},
 		},
 		{
@@ -243,9 +243,9 @@ func TestNat64SourceEndpoints_VariousCases(t *testing.T) {
 				})
 			},
 			asserts: func(eps []*endpoint.Endpoint, err error) {
-				assert.Nil(t, eps)
+				require.Nil(t, eps)
 				require.Error(t, err)
-				assert.EqualError(t, err, "could not parse [192 0 2 42] to IPv4 address")
+				require.EqualError(t, err, "could not parse [192 0 2 42] to IPv4 address")
 			},
 		},
 	}
@@ -261,7 +261,7 @@ func TestNat64SourceEndpoints_VariousCases(t *testing.T) {
 			src, err := NewNAT64Source(mockSource, []string{"2001:db8::/96"})
 			require.NoError(t, err)
 
-			eps, err := src.Endpoints(context.Background())
+			eps, err := src.Endpoints(t.Context())
 			tc.asserts(eps, err)
 
 			mockSource.AssertExpectations(t)

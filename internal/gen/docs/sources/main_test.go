@@ -21,10 +21,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"sigs.k8s.io/external-dns/pkg/apis/externaldns"
 )
 
 const (
@@ -36,7 +40,7 @@ func TestIndexMdExists(t *testing.T) {
 	testPath, _ := os.Getwd()
 	fsys := os.DirFS(fmt.Sprintf(pathToDocs, testPath))
 	st, err := fs.Stat(fsys, fileName)
-	assert.NoError(t, err, "expected file %s to exist", fileName)
+	require.NoError(t, err, "expected file %s to exist", fileName)
 	assert.Equal(t, fileName, st.Name())
 }
 
@@ -44,27 +48,26 @@ func TestIndexMdUpToDate(t *testing.T) {
 	testPath, _ := os.Getwd()
 	fsys := os.DirFS(fmt.Sprintf(pathToDocs, testPath))
 	expected, err := fs.ReadFile(fsys, fileName)
-	assert.NoError(t, err, "expected file %s to exist", fileName)
+	require.NoError(t, err, "expected file %s to exist", fileName)
 
-	// path to sources folder
-	ssys := os.DirFS(fmt.Sprintf("%s/../../../../source", testPath))
-	sources, err := discoverSources(fmt.Sprintf("%s", ssys))
+	sourceDir := fmt.Sprintf("%s/../../../../source", testPath)
+	sources, err := discoverSources(sourceDir)
 	require.NoError(t, err, "expected to find sources")
 	actual, err := sources.generateMarkdown()
-	assert.NoError(t, err)
-	assert.Contains(t, string(expected), actual, "expected file 'docs/source/index.md' to be up to date. execute 'make generate-sources-documentation'")
+	require.NoError(t, err)
+	assert.Contains(t, string(expected), actual, "expected file 'docs/sources/index.md' to be up to date. execute 'make generate-sources-documentation'")
 }
 
 func TestDiscoverSources(t *testing.T) {
 	testPath, _ := os.Getwd()
-	ssys := os.DirFS(fmt.Sprintf("%s/../../../../source", testPath))
+	sourceDir := fmt.Sprintf("%s/../../../../source", testPath)
 
-	sources, err := discoverSources(fmt.Sprintf("%s", ssys))
+	sources, err := discoverSources(sourceDir)
 	require.NoError(t, err)
 
 	assert.GreaterOrEqual(t, len(sources), 5, "Expected at least 5 sources with annotations")
 
-	// Verify sources are sorted by category, then by name
+	// Verify sources are sorted by name
 	for i := range len(sources) - 1 {
 		prev, curr := sources[i], sources[i+1]
 		if prev.Name > curr.Name {
@@ -110,6 +113,7 @@ func TestParseSourceAnnotations(t *testing.T) {
 // +externaldns:source:filters=annotation,label
 // +externaldns:source:namespace=all,single
 // +externaldns:source:fqdn-template=true
+// +externaldns:source:provider-specific=true
 type testSource struct {
 	client string
 }
@@ -128,6 +132,8 @@ type testSource struct {
 	assert.Equal(t, "annotation,label", source.Filters)
 	assert.Equal(t, "all,single", source.Namespace)
 	assert.Equal(t, "true", source.FQDNTemplate)
+	assert.Equal(t, "false", source.Events)
+	assert.Equal(t, "true", source.ProviderSpecific)
 }
 
 func TestParseSourceAnnotations_SkipsTestFiles(t *testing.T) {
@@ -168,6 +174,7 @@ type firstSource struct {}
 // +externaldns:source:name=second
 // +externaldns:source:category=Testing
 // +externaldns:source:description=Second source
+// +externaldns:source:events=true
 type secondSource struct {}
 `
 	err := os.WriteFile(testFile, []byte(content), 0644)
@@ -177,7 +184,11 @@ type secondSource struct {}
 	require.NoError(t, err)
 	assert.Len(t, sources, 2)
 	assert.Equal(t, "first", sources[0].Name)
+	assert.Equal(t, "false", sources[0].Events)
+	assert.Equal(t, "false", sources[0].ProviderSpecific)
 	assert.Equal(t, "second", sources[1].Name)
+	assert.Equal(t, "true", sources[1].Events)
+	assert.Equal(t, "false", sources[1].ProviderSpecific)
 }
 
 func TestParseFile_IgnoresNonSourceTypes(t *testing.T) {
@@ -377,7 +388,8 @@ func TestExtractSourcesFromComments(t *testing.T) {
 			},
 		},
 		{
-			name: "missing name annotation",
+			name:        "empty name annotation",
+			wantSources: 0,
 			comments: `testSource with minimal annotations.
 
 +externaldns:source:name=
@@ -386,9 +398,6 @@ func TestExtractSourcesFromComments(t *testing.T) {
 `,
 			typeName: "testSource",
 			filePath: "test.go",
-			validate: func(t *testing.T, s Source) {
-				require.Nil(t, s)
-			},
 		},
 	}
 
@@ -412,9 +421,30 @@ func TestExtractSourcesFromComments(t *testing.T) {
 
 			// Verify all sources have required fields
 			for _, source := range sources {
-				assert.Equal(t, source.Type, tt.typeName)
-				assert.Equal(t, source.File, tt.filePath)
+				assert.Equal(t, tt.typeName, source.Type)
+				assert.Equal(t, tt.filePath, source.File)
 			}
 		})
+	}
+}
+
+// TestMultiNamespaceSourcesMatchMarkers keeps the runtime list behind the --namespace
+// validation in sync with the namespace markers the docs are generated from.
+func TestMultiNamespaceSourcesMatchMarkers(t *testing.T) {
+	testPath, _ := os.Getwd()
+	sources, err := discoverSources(fmt.Sprintf("%s/../../../../source", testPath))
+	require.NoError(t, err)
+
+	// gloo-proxy scopes on --gloo-namespace, already repeatable: its marker describes that
+	// flag, while --namespace is ignored.
+	ignoresNamespaceFlag := []string{"gloo-proxy"}
+
+	for _, source := range sources {
+		modes := strings.Split(source.Namespace, ",")
+		// Sources without "single" ignore --namespace, so several values are harmless.
+		want := slices.Contains(modes, "multiple") || !slices.Contains(modes, "single") ||
+			slices.Contains(ignoresNamespaceFlag, source.Name)
+		assert.Equal(t, want, externaldns.SourceSupportsMultipleNamespaces(source.Name),
+			"source %q has namespace marker %q (%s)", source.Name, source.Namespace, source.File)
 	}
 }

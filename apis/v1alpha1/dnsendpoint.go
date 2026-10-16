@@ -35,22 +35,25 @@ import (
 // +versionName=v1alpha1
 type DNSEndpoint struct {
 	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   DNSEndpointSpec   `json:"spec"`
-	Status DNSEndpointStatus `json:"status"`
+	Spec   DNSEndpointSpec   `json:"spec,omitempty"`
+	Status DNSEndpointStatus `json:"status,omitempty"`
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // DNSEndpointList is a list of DNSEndpoint objects
 type DNSEndpointList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []DNSEndpoint `json:"items"`
 }
 
 // DNSEndpointSpec defines the desired state of DNSEndpoint
 type DNSEndpointSpec struct {
+	// Endpoints is the list of DNS records this resource declares.
+	// +optional
+	// +kubebuilder:validation:MaxItems=1000
 	Endpoints []*endpoint.Endpoint `json:"endpoints,omitempty"`
 }
 
